@@ -4,6 +4,8 @@ import numpy as np
 import sympy as sp
 from typing import List, Tuple, Dict, Any, Optional
 
+from microcomb import CombSpec, propose_plan, plan_to_physical, compute_required_global_scale_and_powers
+from viz_couplings import plot_couplings_freqline, plot_coupling_circle_from_edges, plot_pumps_vs_frequency_from_phys
 
 import os
 os.environ["JAX_ENABLE_X64"] = "True"
@@ -208,7 +210,7 @@ def auto_inverse_synthesis(
 
                 sol_full = info["solution_dict_complete"]
 
-                # <<< NEW: also get gamma (port intrinsic losses)
+                # get gamma (port intrinsic losses)
                 pumps, delta, gamma = _extract_params_from_solution_dict(sol_full, N, ports)
 
                 # allow SPS growth numerically if symbolic gave only BS
@@ -297,6 +299,80 @@ if __name__ == "__main__":
     S_map = verify_params(bp, ports=out["ports"], model=make_modelfns_adapter(), omega_list=[0.0])
     print("S[NXN] for isolator:\n", S_map[0.0])
 
+    #this part use a microcomb based on the optimization
+    edges_from_fit = [e for e in bp.pumps if e.type.upper() == "BS" and e.amp >= 1e-4]
+
+    comb = CombSpec(f0_THz=193.518, FSR_GHz=199.9, pump_lines=None, mode_lines=None)
+    plan = propose_plan(
+        edges_from_fit,
+        comb,
+        allowed_edge_types=("BS",),  # BS only
+        min_edge_amp=1e-4,  # ignore tiny junk
+        forbid_pump_on_mode_lines=True,  # keep pumps off your signal-mode lines
+        auto_max_pumps=3,
+        auto_max_span=6,
+    )
+    phys = plan_to_physical(plan)
+    print("Pump freqs (THz):", phys["pump_freqs_THz"])
+    print("Pump phases (rad):", phys["pump_phase_rad"])
+    print("Relative powers:", phys["pump_rel_power"])
+    print("Mode freqs (THz):", phys["mode_freqs_THz"])
+    print("Edge realization:", phys["edge_realization"])
+
+    # --- Build edge lists for plotting ---
+    edges_bs = [e for e in bp.pumps if e.type.upper() == "BS" and e.amp >= 1e-4]
+    edges_sps = [e for e in bp.pumps if e.type.upper() == "SPS" and e.amp >= 1e-4]
+
+    # Mode frequencies (THz) for plotting — use the comb plan output
+    mode_freqs = phys["mode_freqs_THz"]  # dict {mode_index: f_THz}
+
+    # === BS only ===
+    # (A) Frequency-axis view (arches)
+    plot_couplings_freqline(
+        edges_bs,
+        mode_freqs_THz=mode_freqs,
+        show_types=("BS",),  # BS only
+        min_amp=1e-4,
+        title="BS couplings (frequency axis)"
+    )
+
+    # (B) Circular view (matrix-style chords)
+    plot_coupling_circle_from_edges(
+        edges_bs,
+        mode_freqs_THz=mode_freqs,
+        which="BS",
+        min_abs=1e-4,
+        title="g (BS)"
+    )
+
+    # === SPS (only if present and non-negligible) ===
+    if len(edges_sps) > 0:
+        # (A) Frequency-axis view (arches)
+        plot_couplings_freqline(
+            edges_sps,
+            mode_freqs_THz=mode_freqs,
+            show_types=("SPS",),  # SPS only
+            min_amp=1e-4,
+            title="SPS couplings (frequency axis)"
+        )
+
+        # (B) Circular view
+        plot_coupling_circle_from_edges(
+            edges_sps,
+            mode_freqs_THz=mode_freqs,
+            which="SPS",
+            min_abs=1e-4,
+            title="nu (SPS)"
+        )
+
+        plot_pumps_vs_frequency_from_phys(
+            phys,
+            annotate=True,
+            y_unit="rel. power",
+            title="Pumps vs Frequency (relative power)"
+        )
+
+    """
     #Fully directional amplifier, 1 aux mode
     # define constraints (as in the notebook)
     # constraints (same as before)
@@ -325,10 +401,10 @@ if __name__ == "__main__":
 
     out_2 = auto_inverse_synthesis(
         S_target_fda,
-        num_auxiliary_modes=2,
+        num_auxiliary_modes=1,
         allow_squeezing=True,
         enforced_constraints=enforced,
-        port_intrinsic_losses=False,  # <-- aux=2 path (no port losses)
+        port_intrinsic_losses=False,
         mode_types_list=[
             [True, True, True, False],  # particles/holes pattern from the notebook
             [True, False, True, False],
@@ -348,3 +424,8 @@ if __name__ == "__main__":
                             omega_list=[0.0])
     print("loss:", out_2["best"]["loss"])
     print("|S21|:", np.abs(S_map_2[0.0][1, 0]), " |S12|:", np.abs(S_map_2[0.0][0, 1]))
+"""
+
+
+    # Note: once you have a calibration A_p = α * sqrt(P_p[W]),
+    # you can turn 'relative powers' into Watts: P_p = (s_amp/α)^2 * pump_rel_power[p].
