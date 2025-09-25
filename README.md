@@ -1,6 +1,2 @@
 # ENTANGLMENT_AUTOSCATTER
-This code automatically discovers a physical quadratic Hamiltonian (couplings, squeezing, and losses) whose input/output scattering matches a desired target.
-
-THE CODE GOAL: Building an automatic synthesizer (AutoScatter) for Gaussian continuous-variable (CV) photonic systems. Given a target scattering behavior 
-S_target at a set of I/O “port” modes, the code searches over a physical Hamiltonian to find concrete device parameters that realize it.
-
+This code automates the inverse design of a microcomb based system. Its purpose is to identify the optimal pump frequencies, amplitudes, and phases that synthesize a target quadratic Hamiltonian (described by the g and ν matrices). This Hamiltonian governs the system's quantum state and optical behavior. The final goal is to create a specific S
