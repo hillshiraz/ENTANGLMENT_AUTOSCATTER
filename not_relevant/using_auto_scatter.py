@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, Arc
 from matplotlib.lines import Line2D
-from cv_autoscatter import build_g_nu, S_bdg_from_G_NU, scattering_matrix_from_H
+from not_relevant.cv_autoscatter import build_g_nu, S_bdg_from_G_NU, scattering_matrix_from_H
 
 import sympy as sp
 import jax
