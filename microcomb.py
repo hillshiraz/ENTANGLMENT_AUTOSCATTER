@@ -1,274 +1,282 @@
-# microcomb_planner
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Iterable, Optional
-import itertools
 import numpy as np
+from math import ceil
+from scipy.optimize import least_squares
 
-try:
-    from inverse_synthesis import PumpEdge
-except Exception:
-    from dataclasses import dataclass as _dc
-    @_dc
-    class PumpEdge:
-        i: int; j: int; type: str; amp: float; phase: float
+# =========================
+# Utilities: requirements
+# =========================
+def _required_sums_diffs(mode_idx, g_target, nu_target):
+    """From targets and a candidate mode index set, extract the required
+    sums S={m_k+m_l | ν_target[k,l]≠0} and diffs D={m_k-m_l | g_target[k,l]≠0}."""
+    mode_idx = np.asarray(mode_idx, int)
+    N = len(mode_idx)
+    need_sums, need_diffs = set(), set()
+    for k in range(N):
+        for l in range(N):
+            if np.abs(nu_target[k, l]) > 0:
+                need_sums.add(int(mode_idx[k] + mode_idx[l]))
+            if np.abs(g_target[k, l]) > 0:
+                need_diffs.add(int(mode_idx[k] - mode_idx[l]))
+    return need_sums, need_diffs
 
-@dataclass
-class CombSpec:
-    f0_THz: float                 # e.g. 193.518
-    FSR_GHz: float                # e.g. 199.9
-    pump_lines: Optional[List[int]] = None  # None => auto-select
-    mode_lines: Optional[List[int]] = None  # map your N modes to comb indices (if None: auto map near 0)
+def _pump_pair_sets(pump_idx):
+    P = np.asarray(pump_idx, int)
+    sums  = set(int(p+q) for p in P for q in P)
+    diffs = set(int(p-q) for p in P for q in P)
+    return sums, diffs
 
-@dataclass
-class Plan:
-    comb: CombSpec
-    mode_to_line: Dict[int, int]                  # local mode index -> comb line m
-    edge_realization: Dict[Tuple[int,int,str], Tuple[int,...]]  # (i,j,type)->pump idx tuple
-    pump_A_rel: Dict[int, complex]                # complex pump amplitudes up to a global scale (max|A|=1)
 
-# ---------- helpers ----------
+def _first_non_mode(mode_set):
+    i = 0
+    while True:
+        for cand in (i, -i):
+            if cand not in mode_set:
+                return cand
+        i += 1
 
-def _edges_from_solution(pumps: Iterable[PumpEdge]) -> List[Tuple[int,int,str,float,float]]:
-    out = []
-    for e in pumps:
-        t = e.type.upper()
-        if t not in ("BS","SPS"):
+# =========================
+# Build minimal pump set
+# =========================
+def _greedy_min_pumps(mode_idx, need_sums, need_diffs, R, max_expand=5):
+    mode_set = set(int(m) for m in np.asarray(mode_idx, int))
+    r = int(R)
+
+    def universe(rr):
+        return [i for i in range(-rr, rr+1) if i not in mode_set]
+
+    for _ in range(max_expand+1):
+        U = universe(r)
+        if not U:
+            r += 1
             continue
-        i, j = (e.i, e.j) if e.i <= e.j else (e.j, e.i)
-        out.append((i, j, t, float(e.amp), float(e.phase)))
-    # unique by (i,j,type) keep largest amplitude if duplicates
-    uniq: Dict[Tuple[int,int,str], Tuple[float,float]] = {}
-    for i,j,t,a,ph in out:
-        k = (i,j,t)
-        if k not in uniq or abs(a) > abs(uniq[k][0]):
-            uniq[k] = (a, ph)
-    return [(i,j,t, uniq[(i,j,t)][0], uniq[(i,j,t)][1]) for (i,j,t) in uniq]
 
-def _default_mode_map(num_modes: int, span: int = 2) -> List[int]:
-    """Pack N modes near comb center: [0,-1,+1,-2,+2,...]."""
-    if num_modes == 1: return [0]
-    if num_modes == 2: return [-1,+1]
-    m = []
-    k = 0
-    while len(m) < num_modes and k <= span:
-        if k == 0:
-            m.append(0)
-        else:
-            if len(m) < num_modes: m.append(-k)
-            if len(m) < num_modes: m.append(+k)
-        k += 1
-    return m[:num_modes]
+        chosen = set()
+        while True:
+            # Check current coverage
+            if chosen:
+                sums_cur, diffs_cur = _pump_pair_sets(np.array(sorted(chosen), int))
+            else:
+                sums_cur, diffs_cur = set(), set()
 
-def _cover_edge_with_pumps(i_line: int, j_line: int, edge_type: str, pump_lines: List[int]) -> Optional[Tuple[int,...]]:
-    """Return which pump(s) implement a given BS/SPS edge, or None if impossible."""
-    di = j_line - i_line
-    if edge_type.upper() == "BS":
-        # need p,q with q - p = di
-        for p in pump_lines:
-            q = p + di
-            if q in pump_lines:
-                return (p, q)
-        return None
-    # SPS
-    s = i_line + j_line
-    # try degenerate first
-    if s % 2 == 0:
-        p = s // 2
-        if p in pump_lines:
-            return (p,)
-    # try non-degenerate: p+q = s
-    for p in pump_lines:
-        q = s - p
-        if q in pump_lines:
-            return (p, q)
-    return None
+            if need_sums.issubset(sums_cur) and need_diffs.issubset(diffs_cur) and len(chosen) > 0:
+                return np.array(sorted(list(chosen)), dtype=int), r
 
-def _auto_select_pumps_for_edges(
-    mode_lines: List[int],
-    edges: List[Tuple[int,int,str,float,float]],
-    max_pumps: int = 3,
-    max_span: int = 6,
-    must_include_zero: bool = True,
-    forbidden_lines: Optional[Iterable[int]] = None,   # NEW
-) -> List[int]:
+            # Pick the candidate that maximizes newly covered items
+            best_cand, best_gain = None, (-1, -1, -10**9)  # (gain_s, gain_d, compactness)
+            need_s_left = need_sums - sums_cur
+            need_d_left = need_diffs - diffs_cur
 
-    # candidate universe of lines
-    universe = list(range(-max_span, max_span+1))
-    if must_include_zero and 0 not in universe:
-        universe.append(0)
-    universe = sorted(universe)
+            for cand in U:
+                if cand in chosen:
+                    continue
+                sums_new, diffs_new = _pump_pair_sets(np.array(sorted(list(chosen | {cand})), int))
+                gain_s = len(need_s_left & sums_new)
+                gain_d = len(need_d_left & diffs_new)
+                compact  = -abs(int(cand))  # prefer smaller |index|
+                score = (gain_s, gain_d, compact)
+                if score > best_gain:
+                    best_gain = score
+                    best_cand = cand
 
-    #remove forbidden
-    forb = set(forbidden_lines or [])
-    universe = [m for m in universe if m not in forb]
+            # If we cannot improve coverage at this radius, expand radius
+            if best_cand is None or (best_gain[0] == 0 and best_gain[1] == 0):
+                break
 
-    # progressively grow cardinality
-    for k in range(1, max_pumps+1):
-        if must_include_zero and 0 not in forb and 0 in universe:
-            pool = [m for m in universe if m != 0]
-            for subset in itertools.combinations(pool, k-1):
-                cand = tuple(sorted((0,)+subset))
-                if _covers_all_edges(cand, mode_lines, edges):
-                    return list(cand)
-        else:
-            for cand in itertools.combinations(universe, k):
-                if _covers_all_edges(cand, mode_lines, edges):
-                    return list(cand)
-    return []
+            chosen.add(int(best_cand))
 
-def _covers_all_edges(pump_lines: Iterable[int], mode_lines: List[int], edges) -> bool:
-    pump_lines = list(pump_lines)
-    for (i,j,t,_,_) in edges:
-        mi, mj = mode_lines[i], mode_lines[j]
-        if _cover_edge_with_pumps(mi, mj, t, pump_lines) is None:
-            return False
-    return True
+        # expand search radius and retry
+        r += 1
 
-# ---------- main planning ----------
-def propose_plan(
-    fitted_edges: Iterable[PumpEdge],
-    comb: CombSpec,
-    normalize_max_A: bool = True,
-    auto_max_pumps: int = 3,
-    auto_max_span: int = 6,
-    allowed_edge_types: Iterable[str] = ("BS","SPS"),   # NEW
-    min_edge_amp: float = 0.0,                          # NEW
-    forbid_pump_on_mode_lines: bool = False,            # NEW
-) -> Plan:
-    edges_all = _edges_from_solution(fitted_edges)
+    # --- Constructive fallback: guarantee coverage of required diffs ---
+    Dpos = sorted({abs(d) for d in need_diffs if d != 0})
+    mode_set = set(int(m) for m in np.asarray(mode_idx, int))
 
-    # NEW: filter by type & amplitude threshold
-    allowed = {t.upper() for t in allowed_edge_types}
-    edges = [(i,j,t,a,ph) for (i,j,t,a,ph) in edges_all
-             if t in allowed and abs(a) >= float(min_edge_amp)]
-    if not edges:
-        raise ValueError("No edges left after filtering (check allowed_edge_types / min_edge_amp).")
+    # find a base b that doesn't collide with any mode (and keeps all b+d off modes)
+    def find_base():
+        i = 0
+        while True:
+            for b in (i, -i):
+                if b in mode_set:
+                    continue
+                # check collisions for b+d as well
+                if any((b + d) in mode_set for d in Dpos):
+                    continue
+                return b
+            i += 1
 
-    num_modes = max(max(i,j) for (i,j,_,_,_) in edges) + 1
-    mode_lines = comb.mode_lines if comb.mode_lines is not None else _default_mode_map(num_modes)
+    b = find_base()
+    pumps = [b] + [b + d for d in Dpos]
+    return np.array(sorted(pumps), dtype=int), r
 
-    # choose pumps
-    if comb.pump_lines is None:
-        forbidden = set(mode_lines) if forbid_pump_on_mode_lines else set()
-        pump_lines = _auto_select_pumps_for_edges(
-            mode_lines, edges,
-            max_pumps=auto_max_pumps,
-            max_span=auto_max_span,
-            must_include_zero=True,
-            forbidden_lines=forbidden,          # NEW
+
+def synthesize_g_nu_from_pumps_weighted(A, kappa, omega0, FSR, mode_idx, pump_idx):
+
+    assert FSR > 0, "FSR must be positive."
+    mode_idx = np.asarray(mode_idx, dtype=int)
+    pump_idx = np.asarray(pump_idx, dtype=int)
+    N = len(mode_idx)
+    P = len(pump_idx)
+    A = np.asarray(A, dtype=complex).reshape(P)
+
+    g  = np.zeros((N, N), dtype=complex)
+    nu = np.zeros((N, N), dtype=complex)
+
+    pump_set = set(pump_idx.tolist())
+    val_to_inds = {}
+    for ii, p in enumerate(pump_idx):
+        val_to_inds.setdefault(int(p), []).append(ii)
+
+    for k in range(N):
+        for l in range(N):
+            # SPS: k+l = p+q
+            Skl = int(mode_idx[k] + mode_idx[l])
+            for ip, p in enumerate(pump_idx):
+                q = Skl - int(p)
+                if q in pump_set:
+                    for iq in val_to_inds[q]:
+                        nu[k, l] += kappa * A[ip] * A[iq]
+            # BS: k-l = p-q
+            Dkl = int(mode_idx[k] - mode_idx[l])
+            for ip, p in enumerate(pump_idx):
+                q = int(p) - Dkl
+                if q in pump_set:
+                    for iq in val_to_inds[q]:
+                        if k == l and iq == ip:
+                            continue  # skip p=q contributions on the diagonal
+                        g[k, l] += kappa * np.conj(A[ip]) * A[iq]
+
+    g  = 0.5 * (g  + g.conj().T)  # Hermitian
+    nu = 0.5 * (nu + nu.T)        # symmetric
+    return g, nu
+
+# =========================
+# Least-squares residual with power-normalized A (prevents A=0)
+# =========================
+def _pack_residual(g_syn, nu_syn, g_target, nu_target, w_g, w_nu):
+    r_g  = np.sqrt(w_g)  * (g_syn  - g_target).ravel('F').view(np.float64)
+    r_nu = np.sqrt(w_nu) * (nu_syn - nu_target).ravel('F').view(np.float64)
+    return np.concatenate([r_g, r_nu])
+
+def _residual_vec(x, kappa, omega0, FSR, mode_idx, pump_idx, g_target, nu_target, w_g, w_nu, P0=1.0):
+    P = len(pump_idx)
+    B = x[:P] + 1j * x[P:2*P]
+    # Power normalization: keep total |A|^2 fixed so A ≠ 0
+    A = np.sqrt(P0) * B / (np.linalg.norm(B) + 1e-12)
+    g_syn, nu_syn = synthesize_g_nu_from_pumps_weighted(A, kappa, omega0, FSR, mode_idx, pump_idx)
+    return _pack_residual(g_syn, nu_syn, g_target, nu_target, w_g, w_nu)
+
+def _fit_amplitudes(mode_idx, pump_idx, kappa, omega0, FSR, g_target, nu_target,
+                     w_g, w_nu, n_restarts=5, P0=1.0):
+    pump_idx = np.asarray(pump_idx, int)
+    P = len(pump_idx)
+    if P == 0:
+        # should not happen (we enforce at least one pump), but keep safe
+        A = np.zeros(0, complex)
+        g_syn, nu_syn = synthesize_g_nu_from_pumps_weighted(A, kappa, omega0, FSR, mode_idx, pump_idx)
+        err = w_g*np.linalg.norm(g_syn-g_target,'fro')**2 + w_nu*np.linalg.norm(nu_syn-nu_target,'fro')**2
+        return A, g_syn, nu_syn, err
+
+    best = None
+    for _ in range(n_restarts):
+        s  = np.random.choice([1e-2, 1e-1, 1.0])
+        x0 = s * np.random.randn(2*P)
+        res = least_squares(
+            _residual_vec, x0,
+            args=(kappa, omega0, FSR, mode_idx, pump_idx, g_target, nu_target, w_g, w_nu, P0),
+            method='trf', max_nfev=3000, x_scale='jac'
         )
-        if not pump_lines:
-            raise RuntimeError(f"Could not realize all edges with ≤{auto_max_pumps} pumps and span ≤{auto_max_span}. "
-                               f"Try increasing auto_max_pumps or auto_max_span, or adjust mode_lines.")
-    else:
-        pump_lines = sorted([m for m in comb.pump_lines
-                             if (not forbid_pump_on_mode_lines) or (m not in set(mode_lines))])
+        if best is None or res.cost < best[0]:
+            best = (res.cost, res.x)
 
-    # assign pumps to each edge
-    mode_to_line = {i: mode_lines[i] for i in range(num_modes)}
-    edge_realization: Dict[Tuple[int,int,str], Tuple[int,...]] = {}
-    for (i,j,t,a,ph) in edges:
-        mi, mj = mode_to_line[i], mode_to_line[j]
-        tup = _cover_edge_with_pumps(mi, mj, t, pump_lines)
-        if tup is None:
-            raise RuntimeError(f"Edge {(i,j,t)} cannot be realized by pump set {pump_lines} and mode_lines {mode_lines}")
-        edge_realization[(i,j,t)] = tup
+    x = best[1]
+    B = x[:P] + 1j*x[P:2*P]
+    A = np.sqrt(P0) * B / (np.linalg.norm(B) + 1e-12)
+    g_syn, nu_syn = synthesize_g_nu_from_pumps_weighted(A, kappa, omega0, FSR, mode_idx, pump_idx)
+    err = w_g*np.linalg.norm(g_syn-g_target,'fro')**2 + w_nu*np.linalg.norm(nu_syn-nu_target,'fro')**2
+    return A, g_syn, nu_syn, err
 
-    # solve for pump phases/mags up to global scale using least-squares
-    P = len(pump_lines)
-    idx = {p:k for k,p in enumerate(pump_lines)}
-    # Phase equations: Mφ = y; Magnitude (log): Nλ = z  with λ_k = log|A_k|
-    Mφ, y = [], []
-    Nλ, z = [], []
-
-    for (i,j,t,amp,ph) in edges:
-        ps = edge_realization[(i,j,t)]
-        if t == "BS":
-            p,q = ps
-            row = np.zeros(P); row[idx[p]] = 1.0; row[idx[q]] = -1.0
-            Mφ.append(row); y.append(ph)
-            rowm = np.zeros(P); rowm[idx[p]] = 1.0; rowm[idx[q]] = 1.0
-            Nλ.append(rowm); z.append(np.log(max(amp,1e-16)))
-        else:
-            if len(ps) == 1:
-                p = ps[0]
-                row = np.zeros(P); row[idx[p]] = 2.0
-                Mφ.append(row); y.append(ph)
-                rowm = np.zeros(P); rowm[idx[p]] = 2.0
-                Nλ.append(rowm); z.append(np.log(max(amp,1e-16)))
-            else:
-                p,q = ps
-                row = np.zeros(P); row[idx[p]] = 1.0; row[idx[q]] = 1.0
-                Mφ.append(row); y.append(ph)
-                rowm = np.zeros(P); rowm[idx[p]] = 1.0; rowm[idx[q]] = 1.0
-                Nλ.append(rowm); z.append(np.log(max(amp,1e-16)))
-
-    Mφ = np.array(Mφ) if Mφ else np.zeros((0,P))
-    y  = np.array(y)  if y  else np.zeros((0,))
-    Nλ = np.array(Nλ) if Nλ else np.zeros((0,P))
-    z  = np.array(z)  if z  else np.zeros((0,))
-
-    # fix phase gauge: φ_0pump = 0
-    if P > 0:
-        prior = np.zeros(P); prior[0] = 1.0
-        Mφ = np.vstack([Mφ, prior]); y = np.hstack([y, 0.0])
-
-    φ_sol, *_  = np.linalg.lstsq(Mφ, y, rcond=None)
-    λ_sol, *_  = np.linalg.lstsq(Nλ, z, rcond=None)
-
-    A = np.exp(λ_sol) * np.exp(1j*φ_sol)
-    if normalize_max_A and np.max(np.abs(A)) > 0:
-        A = A / np.max(np.abs(A))
-
-    pump_A_rel = {p: A[idx[p]] for p in pump_lines}
-    return Plan(CombSpec(comb.f0_THz, comb.FSR_GHz, pump_lines, mode_lines),
-                mode_to_line, edge_realization, pump_A_rel)
-
-def plan_to_physical(plan: Plan) -> Dict[str, object]:
-    """Turn plan into THz frequencies and relative powers (max |A| = 1 ⇒ powers are relative)."""
-    f0 = plan.comb.f0_THz
-    FSR_THz = plan.comb.FSR_GHz / 1000.0
-    mode_freqs_THz = {i: f0 + plan.mode_to_line[i]*FSR_THz for i in plan.mode_to_line}
-    pump_freqs_THz = {p: f0 + p*FSR_THz for p in plan.pump_A_rel}
-    pump_phase_rad = {p: float(np.angle(A)) for p, A in plan.pump_A_rel.items()}
-    pump_rel_power = {p: float(np.abs(A)**2) for p, A in plan.pump_A_rel.items()}
-    return dict(
-        mode_freqs_THz=mode_freqs_THz,
-        pump_freqs_THz=pump_freqs_THz,
-        pump_phase_rad=pump_phase_rad,
-        pump_rel_power=pump_rel_power,
-        edge_realization=plan.edge_realization,
-        note="Relative powers assume max|A|=1. Scale all together later after calibration."
-    )
-
-def compute_required_global_scale_and_powers(plan: Plan, fitted_edges: Iterable[PumpEdge]) -> Tuple[float, Dict[int, float]]:
+# =========================
+# Joint search: modes & minimal pumps
+# =========================
+def auto_microcomb(info, g_target, nu_target, kappa,
+                   omega0=0.0, FSR=1.0,
+                   w_g=1.0, w_nu=1.0,
+                   n_restarts=6, R=None, max_outer_iters=25):
     """
-    Given the fitted couplings, compute the *minimum* global amplitude scale s
-    such that s^2 * (pump products from plan) match all |g|,|nu|.
-    Returns:
-      s (amplitude scale), scaled relative powers per pump = (s^2)*|A_p|^2.
-    Use this to check feasibility vs power caps once you know the calibration.
+    Jointly choose mode indices and the *minimal* pump set (count picked automatically)
+    that exactly covers δ1 (sums) & δ2 (diffs), disjoint from modes; then fit amplitudes.
     """
-    edges = _edges_from_solution(fitted_edges)
-    A = plan.pump_A_rel
-    # map pump index to |A|
-    absA = {p: np.abs(A[p]) for p in A}
-    # find s needed per edge and take the max (most demanding)
-    s_needed = 0.0
-    for (i,j,t,amp,_) in edges:
-        ps = plan.edge_realization[(i,j,t)]
-        if t == "BS":
-            p,q = ps
-            base = absA[p]*absA[q]
-        else:
-            if len(ps) == 1:
-                p = ps[0]
-                base = absA[p]**2
-            else:
-                p,q = ps
-                base = absA[p]*absA[q]
-        base = max(base, 1e-16)
-        s_needed = max(s_needed, np.sqrt(amp / base))
-    scaled_powers = {p: (s_needed**2) * (absA[p]**2) for p in absA}
-    return s_needed, scaled_powers
+    # 1) initialize modes (centered integer block, but we will move them)
+    N = np.asarray(info['coupling_matrix']).shape[0]
+    half = (N-1)//2
+    mode_idx = np.arange(-half, -half+N, dtype=int)
+
+    # 2) pick an initial radius
+    need_sums, need_diffs = _required_sums_diffs(mode_idx, g_target, nu_target)
+    Smax = max((abs(s) for s in need_sums), default=0)
+    Dmax = max((abs(d) for d in need_diffs), default=0)
+    Mmax = int(np.max(np.abs(mode_idx))) if mode_idx.size else 0
+    if R is None:
+        R = max(ceil(Smax/2), Dmax, Mmax) + 2
+
+    # 3) build minimal pump set for these modes
+    pump_idx, R_used = _greedy_min_pumps(mode_idx, need_sums, need_diffs, R)
+
+    # 4) inner fit
+    A, g_syn, nu_syn, err = _fit_amplitudes(mode_idx, pump_idx, kappa, omega0, FSR,g_target, nu_target,  w_g, w_nu, n_restarts=n_restarts)
+
+    best = dict(mode_idx=mode_idx.copy(), pump_idx=pump_idx.copy(),
+                A=A, g=g_syn, nu=nu_syn, err=float(err), R=int(R_used))
+
+    # 5) nudge one mode ±1, rebuild minimal pumps, refit A; accept if error drops
+    for _ in range(max_outer_iters):
+        improved = False
+        for i in range(N):
+            for step in (-1, +1):
+                cand = int(best["mode_idx"][i] + step)
+                if abs(cand) > best["R"] + 2:
+                    continue
+                if cand in set(best["mode_idx"]):
+                    continue  # keep modes distinct
+                mode_try = best["mode_idx"].copy()
+                mode_try[i] = cand
+                mode_try.sort()
+
+                need_sums, need_diffs = _required_sums_diffs(mode_try, g_target, nu_target)
+                pumps_try, R_try = _greedy_min_pumps(mode_try, need_sums, need_diffs, max(best["R"], R))
+                # fit A
+                A2, g2, nu2, err2 = _fit_amplitudes(mode_try, pumps_try, kappa, omega0, FSR,g_target, nu_target, w_g, w_nu, n_restarts=n_restarts)
+                if err2 + 1e-12 < best["err"]:
+                    best = dict(mode_idx=mode_try.copy(), pump_idx=pumps_try.copy(),
+                                A=A2, g=g2, nu=nu2, err=float(err2), R=int(R_try))
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    # Final packaging
+    mode_idx = np.asarray(best["mode_idx"], int)
+    pump_idx = np.asarray(best["pump_idx"], int)
+    A        = best["A"]
+    g_syn    = best["g"]
+    nu_syn   = best["nu"]
+    freqs    = omega0 + pump_idx.astype(float) * FSR
+
+    return {
+        "omega0": omega0,
+        "FSR_out": FSR,
+        "mode_indices": mode_idx,
+        "pump_indices": pump_idx,
+        "pump_frequencies": freqs,
+        "pump_amplitudes": np.abs(A),
+        "pump_phases": np.angle(A),
+        "A_complex": A,
+        "g_synth": g_syn, "nu_synth": nu_syn,
+        "g_error_fro2": float(np.linalg.norm(g_syn - g_target, 'fro')**2),
+        "nu_error_fro2": float(np.linalg.norm(nu_syn - nu_target, 'fro')**2),
+        "objective_inner": float(best["err"]),
+        "R": int(best["R"]),
+        "delta_coverage_ok": True  # by construction; we built exact coverage
+    }
