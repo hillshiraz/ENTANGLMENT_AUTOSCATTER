@@ -6,7 +6,7 @@ from deap import base, creator, tools, algorithms
 
 
 # =========================
-# Utilities: requirements (same as yours)
+#functiouns I need for the optimization
 # =========================
 def _required_sums_diffs(mode_idx, g_target, nu_target):
     """From targets and a candidate mode index set, extract the required
@@ -80,8 +80,7 @@ def _pack_residual(g_syn, nu_syn, g_target, nu_target, w_g, w_nu):
 def _residual_vec(x, kappa, omega0, FSR, mode_idx, pump_idx, g_target, nu_target, w_g, w_nu, P0=1.0):
     """Residual function for least_squares."""
     P = len(pump_idx)
-    B = x[:P] + 1j * x[P:2 * P]
-    A = np.sqrt(P0) * B / (np.linalg.norm(B) + 1e-12)
+    A = x[:P] + 1j * x[P:2 * P]
     g_syn, nu_syn = synthesize_g_nu_from_pumps_weighted(A, kappa, omega0, FSR, mode_idx, pump_idx)
     return _pack_residual(g_syn, nu_syn, g_target, nu_target, w_g, w_nu)
 
@@ -108,8 +107,7 @@ def _fit_amplitudes(mode_idx, pump_idx, kappa, omega0, FSR, g_target, nu_target,
             best = (res.cost, res.x)
 
     x = best[1]
-    B = x[:P] + 1j * x[P:2 * P]
-    A = np.sqrt(P0) * B / (np.linalg.norm(B) + 1e-12)
+    A = x[:P] + 1j * x[P:2 * P]
     g_syn, nu_syn = synthesize_g_nu_from_pumps_weighted(A, kappa, omega0, FSR, mode_idx, pump_idx)
     err = w_g * np.linalg.norm(g_syn - g_target, 'fro') ** 2 + w_nu * np.linalg.norm(nu_syn - nu_target, 'fro') ** 2
     return A, g_syn, nu_syn, err
@@ -127,8 +125,24 @@ def _fit_amplitudes_and_get_cost(mode_idx, pump_idx, kappa, omega0, FSR, g_targe
     )
     return best_cost
 
+def _split_side_counts(mode_idx, pump_idx):
+    """Count pumps left/right/inside the mode span."""
+    if len(mode_idx) == 0 or len(pump_idx) == 0:
+        return 0, 0, 0
+    mn, mx = int(np.min(mode_idx)), int(np.max(mode_idx))
+    left  = int(np.sum(pump_idx < mn))
+    right = int(np.sum(pump_idx > mx))
+    inside = int(np.sum((pump_idx >= mn) & (pump_idx <= mx)))
+    return left, right, inside
 
-def fitness_function(individual, info, g_target, nu_target, kappa, omega0, FSR, w_g, w_nu):
+
+def fitness_function(individual, info, g_target, nu_target, kappa, omega0, FSR, w_g, w_nu,
+                     penalty_per_pump=0.5,
+                     separation=False,
+                     separation_mode="enforce",   # "enforce" or "prefer"
+                     balance_penalty=0.0,         # only for prefer; penalize |left-right|
+                     inside_penalty=1e3,          # only for prefer; per pump inside span
+                     enforce_even_balance=False):  # when even #pumps, force left==right
     """
     Genetic Algorithm Fitness Function.
     'individual' is a list of integers representing pump and mode indices.
@@ -146,27 +160,56 @@ def fitness_function(individual, info, g_target, nu_target, kappa, omega0, FSR, 
     if len(mode_idx) != N:
         return float('inf'),
 
-    pump_idx = np.array(list(set(pump_idx_list)), dtype=int)
+    pump_idx = np.array(sorted(list(set(pump_idx_list))), dtype=int)
 
     if set(mode_idx).intersection(set(pump_idx)):
         return float('inf'),
 
+    # --- separation constraint/penalty ---
+    sep_cost = 0.0  # <—— initialize!
+    if separation:
+        left, right, inside = _split_side_counts(mode_idx, pump_idx)
+        if separation_mode == "enforce":
+            # hard rule: all pumps outside and at least one on each side
+            if inside > 0 or left == 0 or right == 0:
+                return float('inf'),
+            # optional even balance rule (only when number of pumps is even)
+            if enforce_even_balance and (num_pumps % 2 == 0) and (left != right):
+                return float('inf'),
+        else:
+            # prefer: add penalties instead of discarding
+            sep_cost += inside_penalty * inside
+            sep_cost += balance_penalty * abs(left - right)
+
+    # sums/diffs coverage
     need_sums, need_diffs = _required_sums_diffs(mode_idx, g_target, nu_target)
     pump_sums, pump_diffs = _pump_pair_sets(pump_idx)
 
     if (len(need_sums) > 0 and not need_sums.issubset(pump_sums)) or \
-            (len(need_diffs) > 0 and not need_diffs.issubset(pump_diffs)):
+       (len(need_diffs) > 0 and not need_diffs.issubset(pump_diffs)):
         return float('inf'),
 
+    # inner fit
     cost = _fit_amplitudes_and_get_cost(mode_idx, pump_idx, kappa, omega0, FSR, g_target, nu_target, w_g, w_nu)
-
     if np.isinf(cost):
         return (1000000.0,)
+
+    # complexity + separation penalties
+    cost += penalty_per_pump * num_pumps
+    cost += sep_cost
     return cost,
 
+def auto_microcomb(info, g_target, nu_target, kappa, omega0=0.0, FSR=1.0, w_g=1.0, w_nu=1.0,
+            pop_size=100, num_gens=30, cx_prob=0.8, mut_prob=0.2,
+            separation=False,  # enforce/prefer pumps outside the mode span
+            separation_mode="enforce",  # "enforce" or "prefer"
+            penalty_per_pump=0.5,  # complexity penalty
+            inside_penalty=1e3,  # used when separation_mode="prefer"
+            balance_penalty=0.0,  # used when separation_mode="prefer"
+            enforce_even_balance=False,  # if True and num_pumps even -> left==right
+            bias_initializer=True  # bias initial individuals to satisfy separation
+    ):
 
-def auto_microcomb(info, g_target, nu_target, kappa, omega0=0.0, FSR=1.0, w_g=1.0, w_nu=1.0, pop_size=100,
-                   num_gens=30, cx_prob=0.8, mut_prob=0.2):
     try:
         creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
         creator.create("Individual", list, fitness=creator.FitnessMin)
@@ -177,7 +220,7 @@ def auto_microcomb(info, g_target, nu_target, kappa, omega0=0.0, FSR=1.0, w_g=1.
 
     toolbox = base.Toolbox()
 
-    MAX_PUMPS = 8
+    MAX_PUMPS = 6
     MODE_RANGE = 20
     PUMP_RANGE = 30
 
@@ -190,8 +233,18 @@ def auto_microcomb(info, g_target, nu_target, kappa, omega0=0.0, FSR=1.0, w_g=1.
     toolbox.register("individual", get_individual)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    toolbox.register("evaluate", fitness_function, info=info, g_target=g_target, nu_target=nu_target, kappa=kappa,
-                     omega0=omega0, FSR=FSR, w_g=w_g, w_nu=w_nu)
+    toolbox.register(
+        "evaluate",
+        fitness_function,
+        info=info, g_target=g_target, nu_target=nu_target, kappa=kappa,
+        omega0=omega0, FSR=FSR, w_g=w_g, w_nu=w_nu,
+        penalty_per_pump=penalty_per_pump,
+        separation=separation,
+        separation_mode=separation_mode,
+        balance_penalty=balance_penalty,
+        inside_penalty=inside_penalty,
+        enforce_even_balance=enforce_even_balance
+    )
 
     toolbox.register("mate", tools.cxTwoPoint)
 

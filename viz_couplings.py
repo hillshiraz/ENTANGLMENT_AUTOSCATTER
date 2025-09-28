@@ -1,6 +1,6 @@
 import numpy as np
-import math
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
 def extract_deltas_from_info(info, N):
     """
@@ -127,5 +127,73 @@ def plot_comb_with_modes(out, omega_modes, freq_unit="THz", stem_scale=1.0):
     plt.ylim(0, max(ymax, baseline_offset * 3))
 
     plt.grid(True, linewidth=0.5, alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+
+def _format_number(val):
+    if isinstance(val, complex):
+        r, im = val.real, val.imag
+        # if purely real
+        if abs(im) < 1e-10:
+            return f"{r:.3f}"
+        # if purely imaginary
+        if abs(r) < 1e-10:
+            return f"{im:.3f}j"
+        # otherwise full complex
+        sign = "+" if im >= 0 else "-"
+        return f"{r:.3f}{sign}{abs(im):.3f}j"
+    else:
+        # real number
+        return f"{val:.3f}"
+
+def plot_col_matrix(mat, round_digits=None, fontsize=9, grid_lw=1.0, frame_lw=1.5):
+    M = np.asarray(mat)
+    if M.ndim != 2:
+        raise ValueError("Input must be a 2D matrix/array.")
+    h, w = M.shape
+
+    # Color grouping (optional rounding to merge near-equal floats)
+    G = np.round(M.astype(float), round_digits) if round_digits is not None else M
+    uniq = np.unique(G)
+    val_to_idx = {v: i for i, v in enumerate(uniq)}
+    idx_grid = np.vectorize(val_to_idx.get)(G)
+
+    # Discrete colormap with one color per unique value
+    base = plt.cm.get_cmap("tab20", max(len(uniq), 1))
+    if len(uniq) <= 20:
+        cmap = base
+    else:
+        reps = int(np.ceil(len(uniq) / 20))
+        colors = np.vstack([plt.cm.get_cmap("tab20", 20)(np.arange(20)) for _ in range(reps)])[:len(uniq)]
+        cmap = ListedColormap(colors)
+
+    # Figure size scales with matrix size
+    scale = 0.85
+    fig, ax = plt.subplots(figsize=(max(3, w*scale), max(3, h*scale)))
+    ax.imshow(idx_grid, cmap=cmap, interpolation="nearest")
+
+    # Draw cell borders
+    for i in range(h):
+        for j in range(w):
+            ax.add_patch(plt.Rectangle((j-0.5, i-0.5), 1, 1,
+                                       fill=False, edgecolor="black", linewidth=grid_lw))
+
+    # Add numbers
+    for i in range(h):
+        for j in range(w):
+            ax.text(j, i, _format_number(M[i, j]),
+                    ha="center", va="center", fontsize=fontsize, color="black")
+
+    # Hide ticks/axes
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values(): s.set_visible(False)
+
+    # Ensure full extent is visible and add a solid outer frame
+    ax.set_xlim(-0.5, w - 0.5)
+    ax.set_ylim(h - 0.5, -0.5)  # flip y so row 0 is at top
+    ax.add_patch(plt.Rectangle((-0.5, -0.5), w, h,
+                               fill=False, edgecolor="black", linewidth=frame_lw))
+
     plt.tight_layout()
     plt.show()
