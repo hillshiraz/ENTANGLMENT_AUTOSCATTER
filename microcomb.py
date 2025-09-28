@@ -1,5 +1,4 @@
 import numpy as np
-from math import ceil
 from scipy.optimize import least_squares
 import random
 from deap import base, creator, tools, algorithms
@@ -137,7 +136,7 @@ def _split_side_counts(mode_idx, pump_idx):
 
 
 def fitness_function(individual, info, g_target, nu_target, kappa, omega0, FSR, w_g, w_nu,
-                     penalty_per_pump=0.5,
+                     penalty_per_pump=1,
                      separation=False,
                      separation_mode="enforce",   # "enforce" or "prefer"
                      balance_penalty=0.0,         # only for prefer; penalize |left-right|
@@ -220,7 +219,7 @@ def auto_microcomb(info, g_target, nu_target, kappa, omega0=0.0, FSR=1.0, w_g=1.
 
     toolbox = base.Toolbox()
 
-    MAX_PUMPS = 6
+    MAX_PUMPS = 8
     MODE_RANGE = 20
     PUMP_RANGE = 30
 
